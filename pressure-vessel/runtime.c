@@ -20,8 +20,10 @@
 #include "runtime.h"
 
 #include <sysexits.h>
+#include <ftw.h>
 
 #include <gio/gio.h>
+#include <liburing.h>
 
 /* Include these before steam-runtime-tools.h so that their backport of
  * G_DEFINE_AUTOPTR_CLEANUP_FUNC will be visible to it */
@@ -686,6 +688,57 @@ pv_runtime_maybe_garbage_collect_subdir (const char *description,
 
   /* We have the lock, which would not have happened if someone was
    * still using the runtime, so we can safely delete it. */
+  {
+    // ASYNC: Delete all files async first.
+    // Optimistic async delete. Let rm_rf_at handle anything missed.
+    int parent_len = strlen(parent);
+    g_autofree gchar *target = g_build_filename(parent, member, NULL);
+    struct io_uring ring;
+    int pending = 0, done = 0;
+    struct io_uring_sqe *sqe;
+    struct io_uring_cqe *cqe;
+
+    io_uring_queue_init(128, &ring, 0); // Deep queue.
+    io_uring_register_ring_fd(&ring);
+    io_uring_close_ring_fd(&ring); // bonus safety this way.
+
+    // Per file function.
+    gint ftw_async_remove (const gchar *path,
+            const struct stat *sb,
+            gint typeflags,
+            struct FTW *ftwbuf)
+    {
+      if (typeflags != FTW_F && typeflags != FTW_SL && typeflags != FTW_SLN) {
+        return 0;
+      }
+      // trace ("Trying to unlink target: %s",path, path+parent_len+1);
+      sqe = io_uring_get_sqe(&ring);
+      io_uring_prep_unlinkat(sqe, parent_fd, path+parent_len+1, 0);
+      io_uring_submit(&ring);
+      pending++;
+      if(pending - done >= 128) { // match queue
+        int err = TEMP_FAILURE_RETRY(io_uring_wait_cqe(&ring, &cqe));
+        io_uring_cqe_seen(&ring, cqe);
+        if (err || cqe->res < 0) return 1;
+        // Try draining whatever else is available.
+        while(io_uring_peek_cqe(&ring, &cqe) == 0) {
+          io_uring_cqe_seen(&ring, cqe);
+          if (cqe->res < 0) return 1;
+          done++;
+        }
+        done++;
+      }
+      return 0;
+    }
+    nftw(target, ftw_async_remove, 10, FTW_DEPTH|FTW_MOUNT|FTW_PHYS);
+    while(pending > done) {
+      int err = TEMP_FAILURE_RETRY(io_uring_wait_cqe(&ring, &cqe));
+      io_uring_cqe_seen(&ring, cqe);
+      if (err) break; // give up flushing the queue.
+      done++;
+    }
+    io_uring_queue_exit(&ring);
+  }
   if (!glnx_shutil_rm_rf_at (parent_fd, member, NULL, &local_error))
     {
       g_debug ("Unable to delete %s/%s: %s",
@@ -1020,7 +1073,7 @@ pv_runtime_create_copy (PvRuntime *self,
               return FALSE;
             }
 
-          if (!pv_mtree_apply (usr_mtree, dest_usr, dest_usr_fd,
+          if (!pv_mtree_apply_async (usr_mtree, dest_usr, dest_usr_fd,
                                self->source_files,
                                (mtree_flags
                                 | PV_MTREE_APPLY_FLAGS_CHMOD_MAY_FAIL
@@ -1833,9 +1886,13 @@ pv_runtime_initable_init (GInitable *initable,
       if (mutable_lock == NULL)
         return FALSE;
 
+      g_autoptr(GError) local_error = NULL;
       if (!pv_runtime_create_copy (self, mutable_lock, usr_mtree,
-                                   mtree_flags, error))
+                                   mtree_flags, &local_error)) {
+        g_debug ("Failure to create runtime from copy: %s",
+                   local_error->message);
         return FALSE;
+      }
     }
 
   if (self->mutable_sysroot != NULL)

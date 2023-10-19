@@ -87,12 +87,13 @@ pressure_vessel_utils = static_library(
     'utils.c',
     'utils.h',
   ] + enums,
-  c_args : pv_c_args,
+  c_args : pv_c_args + ['-fno-omit-frame-pointer'],
   dependencies : [
     threads,
     gio_unix,
     libglnx_dep,
     libsteamrt_static_dep,
+    liburing,
   ],
   include_directories : pv_include_dirs,
   install: false,
@@ -176,7 +177,7 @@ pressure_vessel_wrap_lib = static_library(
     'wrap-setup.c',
     'wrap-setup.h',
   ],
-  c_args : pv_c_args,
+  c_args : pv_c_args + ['-fno-omit-frame-pointer'],
   dependencies : [
     pressure_vessel_utils_dep,
     systemd_codegen_dep,
@@ -198,7 +199,7 @@ pv_bin += executable(
   sources : [
     'wrap.c',
   ],
-  c_args : pv_c_args,
+  c_args : pv_c_args + ['-fno-omit-frame-pointer'],
   dependencies : [
     gio_unix,
     libglnx_dep,

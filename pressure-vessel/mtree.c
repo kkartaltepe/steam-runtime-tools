@@ -29,6 +29,7 @@
 #include "steam-runtime-tools/utils-internal.h"
 
 #include <gio/gunixinputstream.h>
+#include <liburing.h>
 
 #include "enumtypes.h"
 #include "utils.h"
@@ -457,6 +458,205 @@ maybe_chmod (const PvMtreeEntry *entry,
                                   permissions, adjusted_mode);
 }
 
+gboolean
+pv_mtree_apply_async (const char *mtree,
+                      const char *sysroot,
+                      int sysroot_fd,
+                      const char *source_files,
+                      PvMtreeApplyFlags flags,
+                      GError **error)
+{
+  gboolean ret = FALSE;
+  glnx_autofd int mtree_fd = -1;
+  g_autoptr(GInputStream) istream = NULL;
+  g_autoptr(GDataInputStream) reader = NULL;
+  g_autoptr(SrtProfilingTimer) timer = NULL;
+  glnx_autofd int source_files_fd = -1;
+  guint line_number = 0;
+  /* We only emit a warning for the first file we were unable to chmod +x,
+   * and the first file we were unable to chmod -x, per mtree applied;
+   * the second and subsequent file in each class are demoted to INFO. */
+  // GLogLevelFlags chmod_plusx_warning_level = G_LOG_LEVEL_WARNING;
+  // GLogLevelFlags chmod_minusx_warning_level = G_LOG_LEVEL_WARNING;
+  // GLogLevelFlags set_mtime_warning_level = G_LOG_LEVEL_WARNING;
+
+  g_return_val_if_fail (error == NULL || *error == NULL, FALSE);
+  g_return_val_if_fail (mtree != NULL, FALSE);
+  g_return_val_if_fail (sysroot != NULL, FALSE);
+  g_return_val_if_fail (sysroot_fd >= 0, FALSE);
+
+  timer = _srt_profiling_start ("Apply %s to %s", mtree, sysroot);
+
+  if (!glnx_openat_rdonly (AT_FDCWD, mtree, TRUE, &mtree_fd, error))
+    return FALSE;
+
+  istream = g_unix_input_stream_new (g_steal_fd (&mtree_fd), TRUE);
+
+  if (flags & PV_MTREE_APPLY_FLAGS_GZIP)
+    {
+      g_autoptr(GInputStream) filter = NULL;
+      g_autoptr(GZlibDecompressor) decompressor = NULL;
+
+      decompressor = g_zlib_decompressor_new (G_ZLIB_COMPRESSOR_FORMAT_GZIP);
+      filter = g_converter_input_stream_new (istream, G_CONVERTER (decompressor));
+      g_clear_object (&istream);
+      istream = g_object_ref (filter);
+    }
+
+  reader = g_data_input_stream_new (istream);
+  g_data_input_stream_set_newline_type (reader, G_DATA_STREAM_NEWLINE_TYPE_LF);
+
+  if (source_files != NULL)
+    {
+      if (!glnx_opendirat (AT_FDCWD, source_files, FALSE, &source_files_fd,
+                           error))
+        return FALSE;
+    }
+
+  g_info ("Applying \"%s\" to \"%s\"...", mtree, sysroot);
+
+  struct io_uring ring;
+  int pending = 0, done = 0;
+  struct io_uring_sqe *sqe;
+  struct io_uring_cqe *cqe;
+
+  io_uring_queue_init(32, &ring, 0);
+  io_uring_register_ring_fd(&ring);
+  io_uring_close_ring_fd(&ring); // bonus safety this way.
+
+
+  while (TRUE)
+    {
+      g_autofree gchar *line = NULL;
+      g_autoptr(GError) local_error = NULL;
+      g_auto(PvMtreeEntry) entry = PV_MTREE_ENTRY_BLANK;
+
+      line = g_data_input_stream_read_line (reader, NULL, NULL, &local_error);
+
+      if (line == NULL && local_error == NULL)
+        {
+          break; // EOF
+        }
+      else if (local_error != NULL)
+        {
+          g_propagate_prefixed_error (error, g_steal_pointer (&local_error),
+                                      "While reading a line from %s: ",
+                                      mtree);
+          goto done;
+        }
+
+      g_strstrip (line);
+      line_number++;
+
+      trace ("line %u: %s", line_number, line);
+
+      if (!pv_mtree_entry_parse (line, &entry, mtree, line_number, error))
+        goto done;
+
+      if (entry.name == NULL || strcmp (entry.name, ".") == 0 || strcmp(entry.name, "./.") == 0)
+        continue;
+
+      trace ("mtree entry: %s", entry.name);
+
+      // Make space in the ring.
+      if(pending - done >= 32) {
+        int err = TEMP_FAILURE_RETRY(io_uring_wait_cqe(&ring, &cqe));
+        io_uring_cqe_seen(&ring, cqe);
+        if (err || cqe->res < 0) goto done;
+        done++;
+      }
+
+      switch (entry.kind)
+        {
+          case PV_MTREE_ENTRY_KIND_FILE:
+            if (entry.size == 0)
+              {
+                /* For empty files, we can create it from nothing. */
+                sqe = io_uring_get_sqe(&ring);
+                io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+                io_uring_prep_openat(sqe, sysroot_fd, entry.name,
+                                                 (O_RDWR | O_CLOEXEC | O_NOCTTY
+                                                  | O_NOFOLLOW | O_CREAT
+                                                  | O_TRUNC),
+                                                 entry.mode);
+                io_uring_submit(&ring);
+                pending++;
+              }
+            else
+              {
+                /* For regular files, use a hardlink. */
+                const char *source = entry.contents;
+
+                if (source == NULL)
+                  source = entry.name;
+
+                sqe = io_uring_get_sqe(&ring);
+                io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+                io_uring_prep_linkat(sqe, source_files_fd, source, sysroot_fd, entry.name, 0);
+                io_uring_submit(&ring);
+                pending++;
+
+                // ERROR: If it fails to link we do need fixup step to copy it synchronously.
+                // ERROR: Depends on chmod to fixup mode if we created the file this way, but since source must already
+                // be writable its probably ok.
+
+              }
+            break;
+
+          case PV_MTREE_ENTRY_KIND_DIR:
+            sqe = io_uring_get_sqe(&ring);
+            io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+            io_uring_prep_mkdirat(sqe, sysroot_fd, entry.name, entry.mode);
+            io_uring_submit(&ring);
+            pending++;
+            // make directories sync points.
+            while(pending > done) {
+              int err = TEMP_FAILURE_RETRY(io_uring_wait_cqe(&ring, &cqe));
+              io_uring_cqe_seen(&ring, cqe);
+              if (err || cqe->res < 0) goto done;
+              done++;
+            }
+            // ERROR: If it exists, we need a follow up to validate it is a directory.
+            break;
+
+          case PV_MTREE_ENTRY_KIND_LINK:
+            sqe = io_uring_get_sqe(&ring);
+            io_uring_sqe_set_flags(sqe, IOSQE_IO_LINK);
+            io_uring_prep_symlinkat(sqe, entry.link, sysroot_fd, entry.name);
+            io_uring_submit(&ring);
+            pending++;
+            // ERROR: To be idempotent, don't delete an existing symlink.
+            break;
+
+          case PV_MTREE_ENTRY_KIND_BLOCK:
+          case PV_MTREE_ENTRY_KIND_CHAR:
+          case PV_MTREE_ENTRY_KIND_FIFO:
+          case PV_MTREE_ENTRY_KIND_SOCKET:
+          case PV_MTREE_ENTRY_KIND_UNKNOWN:
+          default:
+            return glnx_throw (error,
+                               "%s:%u: Special file not supported",
+                               mtree, line_number);
+        }
+    }
+  while(pending > done) {
+    // TODO: Error tracking for retrying validations on non-fatal errors.
+    int err = TEMP_FAILURE_RETRY(io_uring_wait_cqe(&ring, &cqe));
+    io_uring_cqe_seen(&ring, cqe);
+    if (err || cqe->res < 0) goto done;
+    done++;
+  }
+  ret = TRUE;
+done:
+  if(cqe->res < 0)  {
+    g_info ("Failure (%d) while creating mtree async %s: ", cqe->res, sysroot);
+  }
+  // teardown the ring
+  io_uring_queue_exit(&ring);
+
+  return ret;
+}
+
 /*
  * pv_mtree_apply:
  * @mtree: (type filename): Path to a mtree(5) manifest
@@ -613,6 +813,7 @@ pv_mtree_apply (const char *mtree,
       parent = g_path_get_dirname (entry.name);
       base = glnx_basename (entry.name);
       trace ("Creating %s in %s", parent, sysroot);
+      // SYNC: Requires sync on directories.
       parent_fd = _srt_resolve_in_sysroot (sysroot_fd, parent,
                                            SRT_RESOLVE_FLAGS_MKDIR_P,
                                            NULL, error);
@@ -628,16 +829,6 @@ pv_mtree_apply (const char *mtree,
             if (entry.size == 0)
               {
                 /* For empty files, we can create it from nothing. */
-                fd = TEMP_FAILURE_RETRY (openat (parent_fd, base,
-                                                 (O_RDWR | O_CLOEXEC | O_NOCTTY
-                                                  | O_NOFOLLOW | O_CREAT
-                                                  | O_TRUNC),
-                                                 0644));
-
-                if (fd < 0)
-                  return glnx_throw_errno_prefix (error,
-                                                  "Unable to open \"%s\" in \"%s\"",
-                                                  entry.name, sysroot);
               }
             else if (source_files_fd >= 0)
               {

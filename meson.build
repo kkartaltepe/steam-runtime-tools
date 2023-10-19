@@ -292,6 +292,9 @@ json_glib = dependency(
 threads = dependency(
   'threads',
 )
+liburing = dependency(
+  'liburing',
+)
 
 libelf = dependency(
   'libelf',

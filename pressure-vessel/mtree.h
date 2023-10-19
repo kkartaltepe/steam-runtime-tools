@@ -116,3 +116,10 @@ gboolean pv_mtree_apply (const char *mtree,
                          const char *source_files,
                          PvMtreeApplyFlags flags,
                          GError **error);
+
+gboolean pv_mtree_apply_async (const char *mtree,
+                         const char *sysroot,
+                         int sysroot_fd,
+                         const char *source_files,
+                         PvMtreeApplyFlags flags,
+                         GError **error);
